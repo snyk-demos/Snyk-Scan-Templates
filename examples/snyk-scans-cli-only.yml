@@ -1,0 +1,112 @@
+name: Snyk Scans (CI only)
+# Copy to .github/workflows/ in your repo, then replace YOUR-ORG below.
+#
+# For repos where the Snyk SCM integration already imports and monitors this
+# repository: the platform side is covered there, so this workflow publishes
+# NOTHING to the Snyk UI. No `snyk monitor`, no `--report`. Running both this
+# workflow's publishing and the SCM integration would create duplicate Snyk
+# projects with diverging ignore state.
+#
+# What it does instead: pure CI gating. SCA, Code (SAST), and IaC run on
+# every push to any branch and on every pull request, with SARIF uploaded to
+# GitHub code scanning and the sticky PR comment. The container scan runs
+# only on pushes or merges to the default branch, because the image is built
+# here and never exists in Git, which is the one thing the SCM integration
+# cannot see. It scans and uploads SARIF only; monitor stays off.
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
+  push:
+    branches: ['**']   # every branch; the container job gates itself to main
+permissions:
+  contents: read
+  pull-requests: write   # sticky PR comments
+  security-events: write # upload SARIF to code scanning
+  actions: read          # required by code scanning on private repos
+concurrency:
+  group: snyk-ci-${{ github.event.pull_request.number || github.ref_name }}
+  # Never cancel a default-branch run: it produces the code scanning baseline.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+jobs:
+  sca:
+    name: SCA
+    # Fork PRs get no secrets, so the scan cannot run. A branch push and its
+    # open PR both trigger; the concurrency group keeps them from stacking.
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      # Dependency install happens inside the action. install-command
+      # defaults to "auto", covering Snyk's CLI support matrix: npm/yarn/
+      # pnpm, pip/poetry/pipenv/setup.py, Ruby, PHP, .NET, Maven, Gradle,
+      # sbt, Go, Elixir, Swift/CocoaPods. Lockfile-read ecosystems install
+      # nothing; lifecycle scripts are disabled everywhere. Override it, or
+      # "skip" it entirely:
+      #   install-command: "dotnet restore"
+      #   install-command: "make deps"
+      #   install-command: "skip"
+      # Need a pinned toolchain? Add actions/setup-node / setup-python /
+      # setup-java before this step; auto-detect uses whatever is on PATH.
+      - uses: YOUR-ORG/snyk-scan-templates/sca@v1
+        with:
+          snyk-token: ${{ secrets.SNYK_TOKEN }}
+          # monitor deliberately left at its "false" default: the SCM
+          # integration owns the Snyk UI side for this repo.
+  code:
+    name: Code
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: YOUR-ORG/snyk-scan-templates/code@v1
+        with:
+          snyk-token: ${{ secrets.SNYK_TOKEN }}
+  iac:
+    name: IaC
+    # Do NOT add a dependency install to this job. Snyk IaC walks the whole
+    # tree and dies on malformed JSON inside node_modules, and it has no
+    # --exclude flag.
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: YOUR-ORG/snyk-scan-templates/iac@v1
+        with:
+          snyk-token: ${{ secrets.SNYK_TOKEN }}
+  # Pushes or merges to the default branch only: the on.push trigger fires
+  # for every branch, so this job filters itself. A merged PR lands here as
+  # the merge commit's push event. Scan and SARIF only, no monitor.
+  container:
+    name: Container
+    if: github.event_name == 'push' && (github.ref_name == 'main' || github.ref_name == 'master')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      # The image is tagged with the repository name (lowercased: Docker
+      # requires it) so scan results trace back to where the image came
+      # from. Never "local/app". Skips itself when there is no Dockerfile.
+      - name: Resolve image name
+        id: img
+        env:
+          REPO: ${{ github.repository }}
+        run: |
+          if [ ! -f Dockerfile ]; then
+            echo "::notice::No Dockerfile at the repo root; skipping the container scan."
+            echo "exists=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          echo "exists=true" >> "$GITHUB_OUTPUT"
+          echo "name=$(printf '%s' "$REPO" | tr '[:upper:]' '[:lower:]'):$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+      - if: steps.img.outputs.exists == 'true'
+        run: docker build -t "${{ steps.img.outputs.name }}" .
+      - if: steps.img.outputs.exists == 'true'
+        uses: YOUR-ORG/snyk-scan-templates/container@v1
+        with:
+          snyk-token: ${{ secrets.SNYK_TOKEN }}
+          image: ${{ steps.img.outputs.name }}
+          pr-comment: "false"   # a default-branch push has no PR
+          # monitor left at its "false" default: results stay in CI and
+          # GitHub code scanning only.

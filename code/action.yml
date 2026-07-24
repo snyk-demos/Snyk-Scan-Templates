@@ -1,0 +1,184 @@
+name: Snyk Code scan
+description: >
+  Static analysis of your own code (snyk code test).
+
+inputs:
+  snyk-token:
+    description: Snyk API token. Set it as a repo or org secret.
+    required: true
+  snyk-org:
+    description: Snyk org slug or UUID. Only needed if your token spans orgs.
+    default: ""
+  monitor:
+    description: >
+      "true" publishes results to the Snyk Web UI so the platform tracks this
+      project over time (trending, notifications on newly disclosed vulns,
+      UI-managed ignores). Enable on default-branch pushes only, or every PR
+      branch becomes a Snyk project.
+    default: "false"
+  target-reference:
+    description: Branch or version grouping for published snapshots, e.g. main.
+    default: ""
+  severity-threshold:
+    description: "low | medium | high | critical. Findings below this are ignored."
+    default: high
+  fail-on-findings:
+    description: >
+      "true" fails this check when findings exist. Leave "false" and let the
+      code scanning check do the blocking instead, or you gate twice.
+    default: "false"
+  upload-sarif:
+    description: >
+      "true" sends results to GitHub code scanning: PR diff annotations, new
+      vs existing alert detection, and the alerts UI. Free on public repos;
+      private repos need GitHub Code Security.
+    default: "true"
+  pr-comment:
+    description: '"true" posts/updates one sticky comment on the PR.'
+    default: "true"
+  working-directory:
+    description: Directory to scan. For monorepos.
+    default: "."
+  extra-args:
+    description: Extra Snyk CLI flags, appended verbatim.
+    default: ""
+  comment-marker:
+    description: >
+      Identifies this scan's sticky comment and its code scanning category.
+      Only change it if you call this action twice in one repo.
+    default: snyk-code
+  snyk-cli-version:
+    description: '"latest", or a version like "1.1306.1" to pin.'
+    default: latest
+  github-token:
+    description: Token used to read the PR and write the comment.
+    default: ${{ github.token }}
+
+outputs:
+  exit-code:
+    description: "Snyk CLI exit code: 0 clean, 1 findings, 2 error, 3 nothing to scan."
+    value: ${{ steps.scan.outputs.code }}
+  results-file:
+    description: SARIF path, relative to working-directory.
+    value: snyk-code.sarif
+
+runs:
+  using: composite
+  steps:
+    # A missing GitHub secret is silently an empty string, so a bad setup
+    # otherwise shows up as an opaque 401 minutes later. Catch it in a second.
+    - name: Check token
+      shell: bash
+      env:
+        SNYK_TOKEN: ${{ inputs.snyk-token }}
+      run: |
+        if [ -z "$SNYK_TOKEN" ]; then
+          echo "::error::snyk-token is empty. Set the SNYK_TOKEN secret on this repo or org."
+          exit 1
+        fi
+
+    - name: Install Snyk CLI
+      shell: bash
+      env:
+        SNYK_VERSION: ${{ inputs.snyk-cli-version }}
+      run: bash "${{ github.action_path }}/../scripts/install-snyk.sh"
+
+    # Exit codes: 0 clean, 1 findings, 2 error, 3 nothing to scan.
+    # Inputs reach the shell only via env vars, never interpolated into the
+    # run block, so a hostile input cannot inject script.
+    - name: Code scan
+      id: scan
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        SNYK_TOKEN: ${{ inputs.snyk-token }}
+        SNYK_CFG_ORG: ${{ inputs.snyk-org }}
+        SEVERITY: ${{ inputs.severity-threshold }}
+        EXTRA_ARGS: ${{ inputs.extra-args }}
+        MONITOR: ${{ inputs.monitor }}
+        TARGET_REF: ${{ inputs.target-reference }}
+        GH_REPO: ${{ github.repository }}
+        REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+      run: |
+        set +e
+        if [ "$MONITOR" = "true" ]; then
+          args+=(--report --project-name="$GH_REPO" --remote-repo-url="$REPO_URL")
+          [ -n "$TARGET_REF" ] && args+=(--target-reference="$TARGET_REF")
+        fi
+        snyk code test "${args[@]}" $EXTRA_ARGS 2>&1 | tee snyk-code.log
+        echo "code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+        exit 0
+
+    # Error classification.
+    - name: Diagnose
+      id: diag
+      if: always()
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        CLASSIFY_LOG: snyk-code.log
+        CLASSIFY_EXIT: ${{ steps.scan.outputs.code }}
+        CLASSIFY_SCAN: Code
+      run: python3 "${{ github.action_path }}/../scripts/classify.py"
+
+    - name: Report
+      if: always()
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        GH_REPO: ${{ github.repository }}
+        TITLE: Snyk Code (${{ inputs.severity-threshold }}+)
+        FILE: snyk-code.sarif
+        EXIT_CODE: ${{ steps.scan.outputs.code }}
+        MARKER: ${{ inputs.comment-marker }}
+        PR_COMMENT: ${{ inputs.pr-comment }}
+        ERROR_MESSAGE: ${{ steps.diag.outputs.message }}
+        ERROR_HINT: ${{ steps.diag.outputs.hint }}
+      run: bash "${{ github.action_path }}/../scripts/report.sh"
+
+    # No SARIF when a scan is completely clean.
+    - name: Upload to code scanning
+      if: always() && inputs.upload-sarif == 'true'
+      shell: bash
+      id: sarif
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        if [ -s "snyk-code.sarif" ]; then echo "ok=true" >> "$GITHUB_OUTPUT"
+        else echo "ok=false" >> "$GITHUB_OUTPUT"; echo "::notice::No SARIF produced; nothing to upload."; fi
+
+    - name: Upload SARIF
+      if: always() && inputs.upload-sarif == 'true' && steps.sarif.outputs.ok == 'true'
+      uses: github/codeql-action/upload-sarif@v4
+      with:
+        sarif_file: ${{ inputs.working-directory }}/snyk-code.sarif
+        # Must be unique per scan: code scanning allows one upload per category.
+        category: ${{ inputs.comment-marker }}
+        checkout_path: ${{ github.workspace }}/${{ inputs.working-directory }}
+        token: ${{ inputs.github-token }}
+
+    # Incomplete results must never look clean.
+    - name: Gate
+      if: always()
+      shell: bash
+      env:
+        CODE: ${{ steps.scan.outputs.code }}
+        MESSAGE: ${{ steps.diag.outputs.message }}
+        HINT: ${{ steps.diag.outputs.hint }}
+        FAIL_ON: ${{ inputs.fail-on-findings }}
+        SEVERITY: ${{ inputs.severity-threshold }}
+      run: |
+        case "${CODE:-none}" in
+          0)
+            echo "Code: clean." ;;
+          3)
+            echo "Code: nothing to scan." ;;
+          1)
+            if [ "$FAIL_ON" = "true" ]; then
+              echo "::error::Code: findings at ${SEVERITY}+ severity."; exit 1
+            fi
+            echo "Code: findings reported, not gated here." ;;
+          *)
+            echo "::error::${MESSAGE:-Code: scan failed (exit ${CODE:-unknown}).} ${HINT}"
+            exit 1 ;;
+        esac
